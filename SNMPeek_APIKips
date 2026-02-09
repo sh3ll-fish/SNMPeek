@@ -1,0 +1,918 @@
+#!/home/tuna/Documents/coding/SNMPeek/.venv/bin/python
+"""Query AKIPS for all hosts within a given CIDR subnet."""
+
+import argparse
+import csv
+import fnmatch
+import ipaddress
+import os
+import re
+import sys
+from datetime import datetime
+
+from akips import AKIPS
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+console = Console()
+
+# MAC address formats: AA:BB:CC:DD:EE:FF, AA-BB-CC-DD-EE-FF,
+# AABB.CCDD.EEFF, AABB-CCDD-EEFF, AABBCCDDEEFF (case-insensitive)
+MAC_PATTERN = re.compile(
+    r"^(?:"
+    r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}"
+    r"|[0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5}"
+    r"|[0-9a-fA-F]{4}(?:\.[0-9a-fA-F]{4}){2}"
+    r"|[0-9a-fA-F]{4}(?:-[0-9a-fA-F]{4}){2}"
+    r"|[0-9a-fA-F]{12}"
+    r")$"
+)
+
+
+def normalize_mac(mac_str):
+    """Normalize a full or partial MAC address to colon-separated lowercase."""
+    hex_chars = re.sub(r"[^0-9a-fA-F]", "", mac_str).lower()
+    if not hex_chars:
+        return mac_str.lower()
+    return ":".join(hex_chars[i : i + 2] for i in range(0, len(hex_chars), 2))
+
+
+def is_partial_mac(s):
+    """Check if string looks like a partial MAC address.
+
+    Requires at least one MAC-style delimiter (: - .) so short hex strings
+    like hostnames are not misidentified.  Full MACs (12 hex chars) are
+    handled by MAC_PATTERN and should be checked first.
+    """
+    s = s.strip()
+    # Colon-separated hex pairs: aa:bb … aa:bb:cc:dd:ee
+    if re.match(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){1,4}$", s):
+        return True
+    # Dash-separated hex pairs: aa-bb … aa-bb-cc-dd-ee
+    if re.match(r"^[0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){1,4}$", s):
+        return True
+    # Cisco dot quads partial: aabb.c … aabb.ccdd
+    if re.match(r"^[0-9a-fA-F]{4}\.[0-9a-fA-F]{1,4}$", s):
+        return True
+    # Dash quads partial: aabb-c … aabb-ccdd
+    if re.match(r"^[0-9a-fA-F]{4}-[0-9a-fA-F]{1,4}$", s):
+        return True
+    return False
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Query AKIPS for hosts by CIDR subnet or hostname pattern.",
+        epilog=(
+            "Auto-detects query type: CIDR (e.g. 10.1.0.0/24), "
+            "MAC address (e.g. aa:bb:cc:dd:ee:ff), "
+            "or hostname wildcard (e.g. *switch*)"
+        ),
+    )
+    parser.add_argument(
+        "query",
+        nargs="+",
+        help="CIDR subnet, MAC address, or hostname pattern — can pass multiple",
+    )
+
+    # Optional field flags
+    fields = parser.add_argument_group("optional fields")
+    fields.add_argument(
+        "-g", "--groups",
+        action="store_true",
+        help="Show group memberships",
+    )
+    fields.add_argument(
+        "-d", "--descr",
+        action="store_true",
+        help="Show system description (OS/model)",
+    )
+    fields.add_argument(
+        "--location",
+        action="store_true",
+        help="Show sysLocation",
+    )
+    fields.add_argument(
+        "-l", "--lldp",
+        action="store_true",
+        help="Show LLDP neighbor info",
+    )
+    fields.add_argument(
+        "--snmp",
+        action="store_true",
+        help="Show SNMP reachability state",
+    )
+    fields.add_argument(
+        "-a", "--all-fields",
+        action="store_true",
+        help="Show all optional fields",
+    )
+
+    # Output options
+    parser.add_argument(
+        "-o", "--output",
+        help="CSV output filename (default: auto-generated)",
+    )
+    parser.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="Skip CSV file generation",
+    )
+
+    args = parser.parse_args()
+
+    # --all-fields enables everything
+    if args.all_fields:
+        args.groups = True
+        args.descr = True
+        args.location = True
+        args.lldp = True
+        args.snmp = True
+
+    return args
+
+
+def classify_query(query_str):
+    """Determine if a query string is a CIDR subnet, MAC address, or hostname pattern.
+
+    Plain strings become substring matches automatically (e.g. "switch" → "*switch*").
+    Explicit wildcards (* or ?) are preserved as-is.
+    """
+    # Check for full MAC address, then partial MAC
+    stripped = query_str.strip()
+    if MAC_PATTERN.match(stripped):
+        return "mac", normalize_mac(stripped)
+    if is_partial_mac(stripped):
+        return "mac", normalize_mac(stripped)
+
+    try:
+        network = ipaddress.ip_network(query_str, strict=False)
+        return "subnet", network
+    except ValueError:
+        # Auto-wrap as substring match if no wildcards present
+        if "*" not in query_str and "?" not in query_str:
+            query_str = f"*{query_str}*"
+        return "hostname", query_str
+
+
+def connect_akips():
+    """Initialize AKIPS API client from .env credentials."""
+    load_dotenv()
+
+    server = os.getenv("AKIPS_SERVER")
+    username = os.getenv("AKIPS_USERNAME", "api-ro")
+    password = os.getenv("AKIPS_PASSWORD")
+    verify_ssl = os.getenv("AKIPS_VERIFY_SSL", "true").lower() == "true"
+    tz = os.getenv("AKIPS_TIMEZONE", "America/New_York")
+
+    if not server or not password:
+        console.print(
+            "[bold red]Missing AKIPS_SERVER or AKIPS_PASSWORD in .env file.[/]\n"
+            "Copy .env.example to .env and fill in your credentials."
+        )
+        sys.exit(1)
+
+    return AKIPS(
+        server=server,
+        username=username,
+        password=password,
+        verify=verify_ssl,
+        timezone=tz,
+    )
+
+
+def fetch_data(api, args):
+    """Fetch devices and optional extra data from AKIPS based on requested fields."""
+    with console.status("[bold cyan]Fetching devices from AKIPS..."):
+        devices = api.get_devices()
+
+    with console.status("[bold cyan]Fetching ping states..."):
+        ping_states = api.get_attributes(attribute="PING.icmpState")
+
+    extras = {}
+
+    if args.groups:
+        with console.status("[bold cyan]Fetching group memberships..."):
+            extras["groups"] = api.get_group_membership()
+
+    if args.snmp:
+        with console.status("[bold cyan]Fetching SNMP states..."):
+            extras["snmp"] = api.get_attributes(attribute="SNMP.snmpState")
+
+    if args.lldp:
+        with console.status("[bold cyan]Fetching LLDP neighbors..."):
+            extras["lldp"] = api.get_attributes(
+                attribute="/LLDP-MIB.lldpRemSysName|LLDP-MIB.lldpRemPortId/"
+            )
+
+    return devices, ping_states, extras
+
+
+def parse_enum_state(enum_data):
+    """Parse an AKIPS enum string into (value, modified_datetime).
+
+    Enum format: number,value,created,modified,description
+    """
+    if not enum_data:
+        return None, None
+
+    match = re.match(r"^(\S*),(\S*),(\S*),(\S*),(.*)$", enum_data)
+    if not match:
+        return None, None
+
+    value = match.group(2)
+    try:
+        modified = datetime.fromtimestamp(int(match.group(4)))
+    except (ValueError, OSError):
+        modified = None
+
+    return value, modified
+
+
+def format_uptime(delta):
+    """Format a timedelta into a human-readable uptime string."""
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 0:
+        return "N/A"
+
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
+    elif hours > 0:
+        return f"{hours}h {minutes}m"
+    else:
+        return f"{minutes}m"
+
+
+def filter_and_merge(networks, hostname_patterns, devices, ping_states, extras, args):
+    """Filter devices matching ANY of the given subnets or hostname patterns."""
+    results = []
+    now = datetime.now()
+
+    if not devices:
+        return results
+
+    for device_name, attrs in devices.items():
+        ip_str = attrs.get("ip4addr")
+        hostname = attrs.get("SNMPv2-MIB.sysName") or device_name
+
+        # Parse IP once
+        ip = None
+        if ip_str:
+            try:
+                ip = ipaddress.ip_address(ip_str)
+            except ValueError:
+                pass
+
+        # Check if device matches any filter
+        matched = False
+
+        for network in networks:
+            if ip and ip in network:
+                matched = True
+                break
+
+        if not matched:
+            for pattern in hostname_patterns:
+                if fnmatch.fnmatch(hostname.lower(), pattern.lower()):
+                    matched = True
+                    break
+                if fnmatch.fnmatch(device_name.lower(), pattern.lower()):
+                    matched = True
+                    break
+
+        if not matched:
+            continue
+
+        # -- Default fields --
+
+        # Ping state → status, uptime, last_seen
+        status = "Unknown"
+        uptime = None
+        last_seen = None
+        if ping_states and device_name in ping_states:
+            for _child, child_attrs in ping_states[device_name].items():
+                ping_val = child_attrs.get("PING.icmpState")
+                if ping_val:
+                    value, modified = parse_enum_state(ping_val)
+                    if value and value.lower() == "up":
+                        status = "Active"
+                        last_seen = now
+                        if modified:
+                            uptime = now - modified
+                    elif value:
+                        status = "Inactive"
+                        last_seen = modified
+                    break
+
+        row = {
+            "hostname": hostname,
+            "ip": ip_str or "N/A",
+            "status": status,
+            "uptime": uptime,
+            "last_seen": last_seen,
+            "_ip_obj": ip,
+        }
+
+        # -- Optional fields --
+
+        if args.descr:
+            row["descr"] = attrs.get("SNMPv2-MIB.sysDescr") or ""
+
+        if args.location:
+            row["location"] = attrs.get("SNMPv2-MIB.sysLocation") or ""
+
+        if args.groups:
+            group_data = extras.get("groups")
+            row["groups"] = group_data.get(device_name, []) if group_data else []
+
+        if args.snmp:
+            snmp_data = extras.get("snmp")
+            snmp_status = "Unknown"
+            if snmp_data and device_name in snmp_data:
+                for _child, child_attrs in snmp_data[device_name].items():
+                    snmp_val = child_attrs.get("SNMP.snmpState")
+                    if snmp_val:
+                        value, _ = parse_enum_state(snmp_val)
+                        snmp_status = value or "Unknown"
+                        break
+            row["snmp_state"] = snmp_status
+
+        if args.lldp:
+            lldp_data = extras.get("lldp")
+            neighbors = []
+            if lldp_data and device_name in lldp_data:
+                for _child, child_attrs in lldp_data[device_name].items():
+                    remote_name = child_attrs.get("LLDP-MIB.lldpRemSysName", "")
+                    remote_port = child_attrs.get("LLDP-MIB.lldpRemPortId", "")
+                    if remote_name or remote_port:
+                        part = remote_name
+                        if remote_port:
+                            part += f" ({remote_port})" if part else remote_port
+                        neighbors.append(part)
+            row["lldp"] = neighbors
+
+        results.append(row)
+
+    results.sort(key=lambda r: r["_ip_obj"] or ipaddress.ip_address("0.0.0.0"))
+    return results
+
+
+def display_results(results, networks=None, hostname_patterns=None, args=None):
+    """Print a rich formatted table to the terminal."""
+    active = sum(1 for r in results if r["status"] == "Active")
+    inactive = sum(1 for r in results if r["status"] == "Inactive")
+    unknown = sum(1 for r in results if r["status"] == "Unknown")
+
+    summary = Text()
+    for network in (networks or []):
+        summary.append(f"Subnet: {network}  |  ", style="bold")
+    for pattern in (hostname_patterns or []):
+        summary.append(f"Hostname: {pattern}  |  ", style="bold")
+    summary.append(f"Found: {len(results)}  |  ", style="bold")
+    summary.append(f"Active: {active}", style="bold green")
+    summary.append("  |  ")
+    summary.append(f"Inactive: {inactive}", style="bold red")
+    if unknown:
+        summary.append("  |  ")
+        summary.append(f"Unknown: {unknown}", style="bold yellow")
+
+    console.print()
+    console.print(Panel(summary, title="[bold]AKIPS Host Query[/]", border_style="blue"))
+    console.print()
+
+    if not results:
+        console.print("[yellow]No hosts found matching query.[/]")
+        return
+
+    table = Table(
+        show_header=True,
+        header_style="bold white on dark_blue",
+        row_styles=["", "on grey11"],
+        border_style="bright_blue",
+        pad_edge=True,
+        show_lines=False,
+    )
+
+    # Default columns
+    table.add_column("Hostname", style="bold cyan", min_width=16)
+    table.add_column("IP Address", style="white", min_width=15)
+    table.add_column("Status", justify="center", min_width=10)
+    table.add_column("Uptime", min_width=12)
+    table.add_column("Last Seen", min_width=19)
+
+    # Optional columns
+    if args.descr:
+        table.add_column("Description", max_width=40)
+    if args.location:
+        table.add_column("Location", max_width=30)
+    if args.groups:
+        table.add_column("Groups", max_width=30)
+    if args.snmp:
+        table.add_column("SNMP", justify="center", min_width=8)
+    if args.lldp:
+        table.add_column("LLDP Neighbors", max_width=45)
+
+    for row in results:
+        # Status
+        if row["status"] == "Active":
+            status_text = Text("\u25cf Active", style="bold green")
+        elif row["status"] == "Inactive":
+            status_text = Text("\u25cf Inactive", style="bold red")
+        else:
+            status_text = Text("\u25cf Unknown", style="bold yellow")
+
+        # Uptime
+        if row["uptime"]:
+            uptime_str = format_uptime(row["uptime"])
+            uptime_text = Text(uptime_str, style="green" if row["status"] == "Active" else "white")
+        else:
+            uptime_text = Text("N/A", style="dim")
+
+        # Last seen
+        if row["last_seen"]:
+            last_seen_str = row["last_seen"].strftime("%Y-%m-%d %H:%M")
+        else:
+            last_seen_str = "N/A"
+
+        cells = [
+            row["hostname"],
+            row["ip"],
+            status_text,
+            uptime_text,
+            last_seen_str,
+        ]
+
+        if args.descr:
+            cells.append(row.get("descr", ""))
+        if args.location:
+            cells.append(row.get("location", ""))
+        if args.groups:
+            grps = row.get("groups", [])
+            cells.append(", ".join(grps) if grps else "None")
+        if args.snmp:
+            snmp = row.get("snmp_state", "Unknown")
+            if snmp.lower() == "up":
+                cells.append(Text("\u25cf up", style="green"))
+            elif snmp.lower() == "down":
+                cells.append(Text("\u25cf down", style="red"))
+            else:
+                cells.append(Text(snmp, style="dim"))
+        if args.lldp:
+            nbrs = row.get("lldp", [])
+            cells.append(", ".join(nbrs) if nbrs else "None")
+
+        table.add_row(*cells)
+
+    console.print(table)
+    console.print()
+
+
+def write_csv(results, filename, args):
+    """Write results to a CSV file."""
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+
+        headers = ["Hostname", "IP Address", "Status", "Uptime", "Last Seen"]
+        if args.descr:
+            headers.append("Description")
+        if args.location:
+            headers.append("Location")
+        if args.groups:
+            headers.append("Groups")
+        if args.snmp:
+            headers.append("SNMP State")
+        if args.lldp:
+            headers.append("LLDP Neighbors")
+        writer.writerow(headers)
+
+        for row in results:
+            uptime_str = format_uptime(row["uptime"]) if row["uptime"] else "N/A"
+            last_seen_str = (
+                row["last_seen"].strftime("%Y-%m-%d %H:%M:%S")
+                if row["last_seen"]
+                else "N/A"
+            )
+            cells = [
+                row["hostname"],
+                row["ip"],
+                row["status"],
+                uptime_str,
+                last_seen_str,
+            ]
+            if args.descr:
+                cells.append(row.get("descr", ""))
+            if args.location:
+                cells.append(row.get("location", ""))
+            if args.groups:
+                grps = row.get("groups", [])
+                cells.append(", ".join(grps) if grps else "")
+            if args.snmp:
+                cells.append(row.get("snmp_state", ""))
+            if args.lldp:
+                nbrs = row.get("lldp", [])
+                cells.append(", ".join(nbrs) if nbrs else "")
+            writer.writerow(cells)
+
+
+# ---------------------------------------------------------------------------
+# MAC address / Switch Port Mapper functions
+# ---------------------------------------------------------------------------
+
+
+def query_spm(api, mac=None, ip=None):
+    """Query the AKiPS Switch Port Mapper (api-spm) endpoint."""
+    params = {}
+    if mac:
+        params["mac"] = mac
+    if ip:
+        params["ip"] = ip
+    if not params:
+        return None
+    try:
+        return api._get(section="api-spm", params=params, timeout=30)
+    except Exception as e:
+        console.print(f"[yellow]SPM query note:[/] {e}")
+        return None
+
+
+def parse_spm_response(text):
+    """Parse the api-spm response into a list of dicts.
+
+    The SPM API typically returns delimited data with fields:
+    MAC, Vendor, Switch, Interface, VLAN, IP (IP may be absent).
+    """
+    if not text or not text.strip():
+        return []
+
+    results = []
+    lines = text.strip().split("\n")
+    first_line = lines[0]
+
+    # Detect delimiter
+    if "\t" in first_line:
+        delimiter = "\t"
+    elif ";" in first_line:
+        delimiter = ";"
+    else:
+        delimiter = ","
+
+    # Check if first line is a header
+    first_fields = [f.strip().lower() for f in first_line.split(delimiter)]
+    header_keywords = {"mac", "vendor", "switch", "interface", "vlan", "ip", "address"}
+    has_header = (
+        sum(1 for f in first_fields if any(kw in f for kw in header_keywords)) >= 2
+    )
+
+    if has_header:
+        headers = [f.strip().lower().replace(" ", "_") for f in first_line.split(delimiter)]
+        for line in lines[1:]:
+            if not line.strip():
+                continue
+            fields = [f.strip() for f in line.split(delimiter)]
+            entry = {}
+            for i, h in enumerate(headers):
+                if i < len(fields):
+                    key = h
+                    if "mac" in h:
+                        key = "mac"
+                    elif "vendor" in h or "manufacturer" in h:
+                        key = "vendor"
+                    elif "switch" in h or "device" in h:
+                        key = "switch"
+                    elif "interface" in h or "port" in h:
+                        key = "interface"
+                    elif "vlan" in h:
+                        key = "vlan"
+                    elif "ip" in h or "address" in h:
+                        key = "ip"
+                    entry[key] = fields[i]
+            results.append(entry)
+    else:
+        field_names = ["mac", "vendor", "switch", "interface", "vlan", "ip"]
+        for line in lines:
+            if not line.strip():
+                continue
+            fields = [f.strip() for f in line.split(delimiter)]
+            entry = {}
+            for i, name in enumerate(field_names):
+                if i < len(fields):
+                    entry[name] = fields[i]
+            results.append(entry)
+
+    return results
+
+
+def fetch_mac_data(api, mac_addresses):
+    """Fetch SPM data and port enrichment for MAC address queries."""
+    all_results = []
+
+    for mac in mac_addresses:
+        with console.status(f"[bold cyan]Querying Switch Port Mapper for {mac}..."):
+            spm_text = query_spm(api, mac=mac)
+
+        entries = parse_spm_response(spm_text) if spm_text else []
+
+        # Enrich each entry with port details from the switch
+        for entry in entries:
+            switch = entry.get("switch", "")
+            interface = entry.get("interface", "")
+
+            if switch and interface:
+                with console.status(
+                    f"[bold cyan]Fetching port details for {switch} {interface}..."
+                ):
+                    try:
+                        port_attrs = api.get_attributes(
+                            device=switch,
+                            child=interface,
+                            attribute="/IF-MIB.ifOperStatus|IF-MIB.ifAlias|IF-MIB.ifHighSpeed|IF-MIB.ifAdminStatus/",
+                        )
+                        if port_attrs and switch in port_attrs:
+                            for _child, attrs in port_attrs[switch].items():
+                                oper = attrs.get("IF-MIB.ifOperStatus")
+                                if oper:
+                                    val, mod = parse_enum_state(oper)
+                                    entry["port_status"] = val or ""
+                                    if mod:
+                                        entry["port_last_change"] = mod
+                                admin = attrs.get("IF-MIB.ifAdminStatus")
+                                if admin:
+                                    val, _ = parse_enum_state(admin)
+                                    entry["admin_status"] = val or ""
+                                entry["port_descr"] = attrs.get("IF-MIB.ifAlias") or ""
+                                speed = attrs.get("IF-MIB.ifHighSpeed")
+                                if speed:
+                                    entry["port_speed"] = speed
+                                break
+                    except Exception:
+                        pass
+
+                # Fetch recent port events for history
+                try:
+                    events = api.get_events(
+                        device=switch,
+                        child=interface,
+                        period="last7d",
+                    )
+                    if events:
+                        entry["events"] = events[:20]
+                except Exception:
+                    pass
+
+        all_results.append({
+            "query_mac": mac,
+            "entries": entries,
+            "raw": spm_text,
+        })
+
+    return all_results
+
+
+def format_speed(speed_raw):
+    """Format interface speed (Mbps) to human-readable string."""
+    if not speed_raw:
+        return ""
+    try:
+        speed_mbps = int(speed_raw)
+        if speed_mbps >= 1000:
+            return f"{speed_mbps // 1000}G"
+        return f"{speed_mbps}M"
+    except ValueError:
+        return speed_raw
+
+
+def display_mac_results(mac_data_list):
+    """Display MAC address lookup results with rich formatting."""
+    for mac_data in mac_data_list:
+        query_mac = mac_data["query_mac"]
+        entries = mac_data["entries"]
+
+        # Summary panel
+        summary = Text()
+        summary.append(f"MAC: {query_mac}  |  ", style="bold")
+        summary.append(f"Results: {len(entries)}", style="bold")
+
+        console.print()
+        console.print(
+            Panel(summary, title="[bold]MAC Address Lookup[/]", border_style="magenta")
+        )
+        console.print()
+
+        if not entries:
+            raw = mac_data.get("raw")
+            if raw:
+                console.print("[yellow]SPM returned data but it could not be parsed:[/]")
+                console.print(raw)
+            else:
+                console.print("[yellow]No results found for this MAC address.[/]")
+                console.print(
+                    "[dim]Ensure the Switch Port Mapper (api-spm) is enabled "
+                    "on your AKiPS server.[/]"
+                )
+            continue
+
+        # Main results table
+        table = Table(
+            show_header=True,
+            header_style="bold white on dark_magenta",
+            row_styles=["", "on grey11"],
+            border_style="magenta",
+            pad_edge=True,
+            show_lines=False,
+        )
+
+        table.add_column("MAC Address", style="bold cyan", min_width=17)
+        table.add_column("Vendor", max_width=20)
+        table.add_column("IP Address", style="white", min_width=15)
+        table.add_column("Switch", style="bold", min_width=16)
+        table.add_column("Port", min_width=14)
+        table.add_column("VLAN", min_width=8)
+        table.add_column("Port Status", justify="center", min_width=10)
+        table.add_column("Speed", justify="right", min_width=8)
+        table.add_column("Description", max_width=30)
+
+        all_events = []
+
+        for entry in entries:
+            mac_str = entry.get("mac", query_mac)
+            vendor = entry.get("vendor", "")
+            ip_addr = entry.get("ip", "")
+            switch = entry.get("switch", "")
+            interface = entry.get("interface", "")
+            vlan = entry.get("vlan", "")
+
+            # Port status with admin-down distinction
+            port_status = entry.get("port_status", "")
+            admin_status = entry.get("admin_status", "")
+            if admin_status.lower() == "down":
+                status_text = Text("\u25cf admin down", style="yellow")
+            elif port_status.lower() == "up":
+                status_text = Text("\u25cf up", style="green")
+            elif port_status.lower() == "down":
+                status_text = Text("\u25cf down", style="red")
+            elif port_status:
+                status_text = Text(port_status, style="dim")
+            else:
+                status_text = Text("\u2014", style="dim")
+
+            speed_str = format_speed(entry.get("port_speed", ""))
+            descr = entry.get("port_descr", "")
+
+            table.add_row(
+                mac_str, vendor, ip_addr or "\u2014", switch, interface,
+                vlan, status_text, speed_str, descr,
+            )
+
+            if "events" in entry:
+                all_events.extend(entry["events"])
+
+        console.print(table)
+        console.print()
+
+        # Port event history
+        if all_events:
+            evt_table = Table(
+                title="Port Event History (Last 7 Days)",
+                show_header=True,
+                header_style="bold white on dark_green",
+                row_styles=["", "on grey11"],
+                border_style="green",
+                pad_edge=True,
+                show_lines=False,
+            )
+            evt_table.add_column("Time", min_width=16)
+            evt_table.add_column("Switch", min_width=16)
+            evt_table.add_column("Port", min_width=14)
+            evt_table.add_column("Type", min_width=10)
+            evt_table.add_column("Details", max_width=50)
+
+            for evt in all_events:
+                try:
+                    time_str = datetime.fromtimestamp(
+                        int(evt["epoch"])
+                    ).strftime("%Y-%m-%d %H:%M")
+                except (ValueError, OSError):
+                    time_str = evt.get("epoch", "")
+
+                evt_table.add_row(
+                    time_str,
+                    evt.get("parent", ""),
+                    evt.get("child", ""),
+                    evt.get("type", ""),
+                    evt.get("details", ""),
+                )
+
+            console.print(evt_table)
+            console.print()
+
+
+def write_mac_csv(mac_data_list, filename):
+    """Write MAC lookup results to a CSV file."""
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Query MAC", "MAC Address", "Vendor", "IP Address",
+            "Switch", "Port", "VLAN", "Port Status", "Admin Status",
+            "Speed (Mbps)", "Port Description", "Port Last Change",
+        ])
+        for mac_data in mac_data_list:
+            for entry in mac_data["entries"]:
+                last_change = entry.get("port_last_change")
+                last_change_str = (
+                    last_change.strftime("%Y-%m-%d %H:%M:%S")
+                    if last_change else ""
+                )
+                writer.writerow([
+                    mac_data["query_mac"],
+                    entry.get("mac", ""),
+                    entry.get("vendor", ""),
+                    entry.get("ip", ""),
+                    entry.get("switch", ""),
+                    entry.get("interface", ""),
+                    entry.get("vlan", ""),
+                    entry.get("port_status", ""),
+                    entry.get("admin_status", ""),
+                    entry.get("port_speed", ""),
+                    entry.get("port_descr", ""),
+                    last_change_str,
+                ])
+
+
+def main():
+    args = parse_args()
+
+    # Classify each query as subnet, hostname, or MAC address
+    networks = []
+    hostname_patterns = []
+    mac_addresses = []
+    for q in args.query:
+        qtype, value = classify_query(q)
+        if qtype == "subnet":
+            networks.append(value)
+        elif qtype == "mac":
+            mac_addresses.append(value)
+        else:
+            hostname_patterns.append(value)
+
+    api = connect_akips()
+
+    # --- MAC address lookups via Switch Port Mapper ---
+    if mac_addresses:
+        try:
+            mac_data = fetch_mac_data(api, mac_addresses)
+        except Exception as e:
+            console.print(f"[bold red]MAC lookup error:[/] {e}")
+            if not (networks or hostname_patterns):
+                sys.exit(1)
+        else:
+            display_mac_results(mac_data)
+
+            if not args.no_csv:
+                mac_parts = [m.replace(":", "") for m in mac_addresses]
+                label = "_".join(mac_parts)
+                if args.output and not (networks or hostname_patterns):
+                    filename = args.output
+                else:
+                    filename = f"akips_mac_{label}.csv"
+                write_mac_csv(mac_data, filename)
+                console.print(f"[bold green]MAC CSV saved to:[/] {filename}")
+
+    # --- Subnet / hostname lookups ---
+    if networks or hostname_patterns:
+        try:
+            devices, ping_states, extras = fetch_data(api, args)
+        except Exception as e:
+            console.print(f"[bold red]AKIPS API error:[/] {e}")
+            sys.exit(1)
+
+        results = filter_and_merge(
+            networks, hostname_patterns, devices, ping_states, extras, args
+        )
+        display_results(
+            results, networks=networks, hostname_patterns=hostname_patterns, args=args
+        )
+
+        if  not args.no_csv:
+            parts = []
+            for n in networks:
+                parts.append(str(n).replace("/", "_"))
+            for h in hostname_patterns:
+                parts.append(h.replace("*", "X").replace("?", "Q"))
+            label = "_".join(parts) or "all"
+            if args.output and not mac_addresses:
+                filename = args.output
+            else:
+                filename = f"akips_hosts_{label}.csv"
+           # write_csv(results, filename, args)
+            #console.print(f"[bold green]CSV saved to:[/] {filename}")
+
+
+if __name__ == "__main__":
+    main()
