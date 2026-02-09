@@ -88,7 +88,7 @@ main()
   |     |     +-- get_attributes()     Enrich: port status/speed/descr
   |     |     +-- get_events()         Enrich: 7-day port event history
   |     +-- display_mac_results()      Rich table + event history table
-  |     +-- write_mac_csv()            CSV export
+  |     +-- [IF --csv] write_mac_csv() CSV export (opt-in)
   |
   +-- [IF networks or hostnames]       === Host Pipeline ===
         +-- fetch_data()
@@ -97,7 +97,7 @@ main()
         |     +-- [optional]           Groups, SNMP state, LLDP neighbors
         +-- filter_and_merge()         Match devices against query filters
         +-- display_results()          Rich table with color-coded status
-        +-- write_csv()                CSV export
+        +-- [IF --csv] write_csv()     CSV export (opt-in)
 ```
 
 \newpage
@@ -128,8 +128,11 @@ flags that control which data columns are displayed.
 
 | Flag | Long Form | Effect |
 |---|---|---|
-| `-o` | `--output` | Custom CSV filename |
-| | `--no-csv` | Skip CSV generation entirely |
+| | `--csv` | Export results to a CSV file |
+| `-o` | `--output` | Write CSV to a specific file (implies `--csv`) |
+
+CSV output is **off by default**; it must be explicitly requested with `--csv`
+or `-o`. When `-o` is provided, `--csv` is automatically set.
 
 When `--all-fields` is set, the code flips all individual field booleans to
 `True` so downstream functions only check the individual flags.
@@ -343,16 +346,16 @@ Port status is color-coded:
 
 Columns: Time, Switch, Port, Type, Details.
 
-### 2.5.6 MAC CSV Export
+### 2.5.6 MAC CSV Export (opt-in)
 
 **Function:** `write_mac_csv(mac_data_list, filename)`
 
-Writes all MAC results to CSV with columns: Query MAC, MAC Address, Vendor,
-IP Address, Switch, Port, VLAN, Port Status, Admin Status, Speed (Mbps),
-Port Description, Port Last Change.
+Only runs when `--csv` or `-o` is specified. Writes all MAC results to CSV with
+columns: Query MAC, MAC Address, Vendor, IP Address, Switch, Port, VLAN,
+Port Status, Admin Status, Speed (Mbps), Port Description, Port Last Change.
 
-Default filename: `akips_mac_<hex>.csv` where `<hex>` is the query MAC with
-colons removed.
+Default filename (when `--csv` is used without `-o`): `akips_mac_<hex>.csv`
+where `<hex>` is the query MAC with colons removed.
 
 \newpage
 
@@ -444,12 +447,13 @@ Status is color-coded with bullet indicators:
 
 Uptime is formatted as human-readable durations: `138d 3h 1m`.
 
-### 2.6.4 Host CSV Export
+### 2.6.4 Host CSV Export (opt-in)
 
 **Function:** `write_csv(results, filename, args)`
 
-Default filename pattern: `akips_hosts_<label>.csv` where label is built from
-query parameters (CIDR slashes become underscores, wildcards become X/Q).
+Only runs when `--csv` or `-o` is specified. Default filename pattern (when
+`--csv` is used without `-o`): `akips_hosts_<label>.csv` where label is built
+from query parameters (CIDR slashes become underscores, wildcards become X/Q).
 
 \newpage
 
@@ -521,7 +525,8 @@ normalize_mac(input)
     |
     v
 +---------------------------+
-| write_mac_csv()           |  CSV file output
+| [IF --csv]                |
+| write_mac_csv()           |  CSV file output (opt-in)
 +---------------------------+
 ```
 
@@ -561,7 +566,8 @@ normalize_mac(input)
          |
          v
 +----------------------------+
-| write_csv()                |  CSV file output
+| [IF --csv]                 |
+| write_csv()                |  CSV file output (opt-in)
 +----------------------------+
 ```
 
@@ -622,6 +628,11 @@ characters with a colon.
 | Mixed query with MAC failure | MAC error printed but host pipeline still runs |
 
 # 7. Output Files
+
+CSV output is **disabled by default**. Pass `--csv` to enable it, or `-o FILE`
+to write to a specific path (which implies `--csv`).
+
+When `--csv` is used without `-o`, filenames are auto-generated:
 
 | Query Type | Default Filename Pattern | Example |
 |---|---|---|

@@ -114,15 +114,19 @@ def parse_args():
     # Output options
     parser.add_argument(
         "-o", "--output",
-        help="CSV output filename (default: auto-generated)",
+        help="Write CSV output to FILE (implies --csv)",
     )
     parser.add_argument(
-        "--no-csv",
+        "--csv",
         action="store_true",
-        help="Skip CSV file generation",
+        help="Export results to a CSV file",
     )
 
     args = parser.parse_args()
+
+    # -o implies --csv
+    if args.output:
+        args.csv = True
 
     # --all-fields enables everything
     if args.all_fields:
@@ -874,7 +878,7 @@ def main():
         else:
             display_mac_results(mac_data)
 
-            if not args.no_csv:
+            if args.csv:
                 mac_parts = [m.replace(":", "") for m in mac_addresses]
                 label = "_".join(mac_parts)
                 if args.output and not (networks or hostname_patterns):
@@ -899,7 +903,7 @@ def main():
             results, networks=networks, hostname_patterns=hostname_patterns, args=args
         )
 
-        if  not args.no_csv:
+        if args.csv:
             parts = []
             for n in networks:
                 parts.append(str(n).replace("/", "_"))
@@ -910,7 +914,7 @@ def main():
                 filename = args.output
             else:
                 filename = f"akips_hosts_{label}.csv"
-           # write_csv(results, filename, args)
+            write_csv(results, filename, args)
             #console.print(f"[bold green]CSV saved to:[/] {filename}")
 
 
