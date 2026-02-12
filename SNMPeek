@@ -34,6 +34,8 @@ MAC_PATTERN = re.compile(
 
 def normalize_mac(mac_str):
     """Normalize a full or partial MAC address to colon-separated lowercase."""
+    
+    # Ensure all letters are in lowercase
     hex_chars = re.sub(r"[^0-9a-fA-F]", "", mac_str).lower()
     if not hex_chars:
         return mac_str.lower()
@@ -47,17 +49,18 @@ def is_partial_mac(s):
     like hostnames are not misidentified.  Full MACs (12 hex chars) are
     handled by MAC_PATTERN and should be checked first.
     """
+
     s = s.strip()
-    # Colon-separated hex pairs: aa:bb … aa:bb:cc:dd:ee
+    # Check for standard color separation
     if re.match(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){1,4}$", s):
         return True
-    # Dash-separated hex pairs: aa-bb … aa-bb-cc-dd-ee
+    # Check for dash separation
     if re.match(r"^[0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){1,4}$", s):
         return True
-    # Cisco dot quads partial: aabb.c … aabb.ccdd
+    # Check for 'quad' format (like HPE etc) but with dots
     if re.match(r"^[0-9a-fA-F]{4}\.[0-9a-fA-F]{1,4}$", s):
         return True
-    # Dash quads partial: aabb-c … aabb-ccdd
+    # Check for dashed quad format like HPE
     if re.match(r"^[0-9a-fA-F]{4}-[0-9a-fA-F]{1,4}$", s):
         return True
     return False
@@ -80,6 +83,7 @@ def parse_args():
 
     # Optional field flags
     fields = parser.add_argument_group("optional fields")
+    
     fields.add_argument(
         "-g", "--groups",
         action="store_true",
@@ -124,7 +128,7 @@ def parse_args():
 
     args = parser.parse_args()
 
-    # -o implies --csv
+    # If -o is given, auto flag csv option
     if args.output:
         args.csv = True
 
@@ -145,18 +149,21 @@ def classify_query(query_str):
     Plain strings become substring matches automatically (e.g. "switch" → "*switch*").
     Explicit wildcards (* or ?) are preserved as-is.
     """
-    # Check for full MAC address, then partial MAC
+
+    # Strip users query and use RE to check if it looks like a full/partial MAC
     stripped = query_str.strip()
     if MAC_PATTERN.match(stripped):
         return "mac", normalize_mac(stripped)
     if is_partial_mac(stripped):
         return "mac", normalize_mac(stripped)
 
+    # If not mac, try to create ipaddress object to see if it's a subnet. 
+    # note: strict=False allows single IPs to be treated as /32.
     try:
         network = ipaddress.ip_network(query_str, strict=False)
         return "subnet", network
     except ValueError:
-        # Auto-wrap as substring match if no wildcards present
+        # At this stage all that remains is a hostname pattern search. Wrap in wildcards and return.
         if "*" not in query_str and "?" not in query_str:
             query_str = f"*{query_str}*"
         return "hostname", query_str
@@ -164,14 +171,18 @@ def classify_query(query_str):
 
 def connect_akips():
     """Initialize AKIPS API client from .env credentials."""
+    
+    # Load our values from the local .env fie
     load_dotenv()
 
+    # Assign values to variables
     server = os.getenv("AKIPS_SERVER")
     username = os.getenv("AKIPS_USERNAME", "api-ro")
     password = os.getenv("AKIPS_PASSWORD")
     verify_ssl = os.getenv("AKIPS_VERIFY_SSL", "true").lower() == "true"
-    tz = os.getenv("AKIPS_TIMEZONE", "America/New_York")
+    tz = os.getenv("AKIPS_TIMEZONE", "America/Los_Angeles")
 
+    # Check if critical info is missing, if so error and exit
     if not server or not password:
         console.print(
             "[bold red]Missing AKIPS_SERVER or AKIPS_PASSWORD in .env file.[/]\n"
@@ -179,6 +190,7 @@ def connect_akips():
         )
         sys.exit(1)
 
+    # Return AKIPS object initilized with creds for API calls
     return AKIPS(
         server=server,
         username=username,
@@ -188,10 +200,14 @@ def connect_akips():
     )
 
 
+
 def fetch_data(api, args):
     """Fetch devices and optional extra data from AKIPS based on requested fields."""
+    
+    # Get devices + corresponding data/states from akips
     with console.status("[bold cyan]Fetching devices from AKIPS..."):
         devices = api.get_devices()
+
 
     with console.status("[bold cyan]Fetching ping states..."):
         ping_states = api.get_attributes(attribute="PING.icmpState")
@@ -220,9 +236,11 @@ def parse_enum_state(enum_data):
 
     Enum format: number,value,created,modified,description
     """
+
+    # Example: Match='2,up,1733253513,1733253550,10.72.0.12', makes this human readable
     if not enum_data:
         return None, None
-
+    # Match with RE the 
     match = re.match(r"^(\S*),(\S*),(\S*),(\S*),(.*)$", enum_data)
     if not match:
         return None, None
@@ -233,6 +251,7 @@ def parse_enum_state(enum_data):
     except (ValueError, OSError):
         modified = None
 
+    print(modified)
     return value, modified
 
 
@@ -262,6 +281,7 @@ def filter_and_merge(networks, hostname_patterns, devices, ping_states, extras, 
     if not devices:
         return results
 
+    # Loop through our list of al devices and determine matches.
     for device_name, attrs in devices.items():
         ip_str = attrs.get("ip4addr")
         hostname = attrs.get("SNMPv2-MIB.sysName") or device_name
@@ -277,11 +297,13 @@ def filter_and_merge(networks, hostname_patterns, devices, ping_states, extras, 
         # Check if device matches any filter
         matched = False
 
+        # Loop through IPs and see if icluded or equal
         for network in networks:
             if ip and ip in network:
                 matched = True
                 break
 
+        # If no matches, try hostname search
         if not matched:
             for pattern in hostname_patterns:
                 if fnmatch.fnmatch(hostname.lower(), pattern.lower()):
@@ -368,6 +390,7 @@ def filter_and_merge(networks, hostname_patterns, devices, ping_states, extras, 
     return results
 
 
+# Print our results in a rich formatted terminal (very nice)
 def display_results(results, networks=None, hostname_patterns=None, args=None):
     """Print a rich formatted table to the terminal."""
     active = sum(1 for r in results if r["status"] == "Active")
@@ -567,13 +590,14 @@ def parse_spm_response(text):
     else:
         delimiter = ","
 
-    # Check if first line is a header
+    # Check if first line returned in response is a header. We check if any of our known header keywords are included in the first field.
     first_fields = [f.strip().lower() for f in first_line.split(delimiter)]
     header_keywords = {"mac", "vendor", "switch", "interface", "vlan", "ip", "address"}
     has_header = (
         sum(1 for f in first_fields if any(kw in f for kw in header_keywords)) >= 2
     )
 
+    # If it has a header, sort and process into appropriate fields.
     if has_header:
         headers = [f.strip().lower().replace(" ", "_") for f in first_line.split(delimiter)]
         for line in lines[1:]:
@@ -598,6 +622,8 @@ def parse_spm_response(text):
                         key = "ip"
                     entry[key] = fields[i]
             results.append(entry)
+
+    # If not header is returned, assume ordering and continue - may need to uddate - JAT 2026-02-04
     else:
         field_names = ["mac", "vendor", "switch", "interface", "vlan", "ip"]
         for line in lines:
@@ -692,6 +718,7 @@ def format_speed(speed_raw):
         return speed_raw
 
 
+# Beautiful rich mac formatter - Need to fix some of the coloring still 
 def display_mac_results(mac_data_list):
     """Display MAC address lookup results with rich formatting."""
     for mac_data in mac_data_list:
@@ -817,6 +844,7 @@ def display_mac_results(mac_data_list):
             console.print()
 
 
+# Write our mac data to results.
 def write_mac_csv(mac_data_list, filename):
     """Write MAC lookup results to a CSV file."""
     with open(filename, "w", newline="") as f:
@@ -852,10 +880,12 @@ def write_mac_csv(mac_data_list, filename):
 def main():
     args = parse_args()
 
-    # Classify each query as subnet, hostname, or MAC address
+    # Initialize empty lists for each type of query (subnet search, hostname search, macaddress search)
     networks = []
     hostname_patterns = []
     mac_addresses = []
+
+    # Process our query(s), classify and sort into assigned list
     for q in args.query:
         qtype, value = classify_query(q)
         if qtype == "subnet":
@@ -865,11 +895,14 @@ def main():
         else:
             hostname_patterns.append(value)
 
+
     api = connect_akips()
 
     # --- MAC address lookups via Switch Port Mapper ---
+    # MAC Prosessing Section - using akips switch port mapper
     if mac_addresses:
         try:
+            # 
             mac_data = fetch_mac_data(api, mac_addresses)
         except Exception as e:
             console.print(f"[bold red]MAC lookup error:[/] {e}")
